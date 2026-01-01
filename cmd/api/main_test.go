@@ -1,10 +1,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 func TestHealthEndpoint(t *testing.T) {
@@ -105,5 +113,96 @@ func TestHostRouting(t *testing.T) {
 				t.Fatalf("expected ost in response, got empty")
 			}
 		})
+	}
+}
+
+func TestRoutingAgainstMultipleBackends(t *testing.T) {
+	ctx := context.Background()
+
+	// define the services we want to spin up
+	services := []struct {
+		name     string
+		expected string
+	}{
+		{"mango", "This is the mango application"},
+		{"apple", "This is the apple application"},
+		{"banana", "This is the banana application"},
+	}
+
+	// build the image once from the app directory
+	appDir, err := filepath.Abs("../../app")
+	if err != nil {
+		t.Fatalf("failed to get app directory: %v", err)
+	}
+
+	var containers []testcontainers.Container
+	var urls []string
+
+	for _, svc := range services {
+		req := testcontainers.ContainerRequest{
+			FromDockerfile: testcontainers.FromDockerfile{
+				Context:    appDir,
+				Dockerfile: "Dockerfile",
+			},
+			ExposedPorts: []string{"5000/tcp"},
+			Env: map[string]string{
+				"APP": svc.name,
+			},
+			WaitingFor: wait.ForHTTP("/").WithPort("5000/tcp").WithStartupTimeout(30 * time.Second),
+		}
+
+		container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+			ContainerRequest: req,
+			Started:          true,
+		})
+		if err != nil {
+			t.Fatalf("failed to start %s container: %v", svc.name, err)
+		}
+
+		containers = append(containers, container)
+
+		mappedPort, err := container.MappedPort(ctx, "5000")
+		if err != nil {
+			t.Fatalf("failed to get mapped port for %s: %v", svc.name, err)
+		}
+
+		host, err := container.Host(ctx)
+		if err != nil {
+			t.Fatalf("failed to get host for %s: %v", svc.name, err)
+		}
+
+		url := fmt.Sprintf("http://%s:%s", host, mappedPort.Port())
+		urls = append(urls, url)
+
+		t.Logf("%s server running at: %s", svc.name, url)
+	}
+
+	defer func() {
+		for i, container := range containers {
+			if err := container.Terminate(ctx); err != nil {
+				t.Logf("failed to terminate %s container: %v", services[i].name, err)
+			}
+		}
+	}()
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	for i, url := range urls {
+		resp, err := client.Get(url)
+		if err != nil {
+			t.Fatalf("failed to GET %s: %v", url, err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("failed to read response from %s: %v", url, err)
+		}
+
+		actual := string(body)
+		if actual != services[i].expected {
+			t.Errorf("%s server: expected %q, got %q", services[i].name, services[i].expected, actual)
+		} else {
+			t.Logf("%s server returned correct response: %q", services[i].name, actual)
+		}
 	}
 }
